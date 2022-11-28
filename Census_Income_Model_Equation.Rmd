@@ -1,0 +1,15 @@
+---
+title: "Census Income Regression Model"
+author: "Ben Stano"
+date: "12/8/2021"
+output:
+  pdf_document:
+    highlight: "kate"
+    df_print: "kable"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+$$ \log(Income) = 8.6 - 0.20 * Black + 1.5*Bachelors + 2.2 *Graduate + 0.93 * SameResidence + 1.0 * Private Transport - 5.8 * Bike - 2.0 * Walk  $$

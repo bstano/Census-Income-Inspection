@@ -1,0 +1,335 @@
+---
+title: "Census Income Exploratory Data Analysis"
+author: "Ben Stano"
+date: "12/14/21"
+output: 
+  pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  fig.pos = "",
+  message = FALSE,
+  tidy = "styler",
+  warning = FALSE,
+  fig.align = "center",
+  highlight = TRUE
+)
+
+library(tidyverse)
+library(broom)
+library(GGally)
+library(corrr)
+library(car)
+```
+
+# Description of Each Variable
+
+## Response
+* median_income: the median income of all people within a tract
+
+## Predictors
+The predictors in the census data were given as a flat number of individuals within the tract who meet the given criteria. We transformed the variables into proportions of a tracts total population to normalize the data and make it more suitable for regression.
+
+* white: percentage of white people in the given tract 
+* bachelors: percentage of people with a bachelor's degree in the given tract
+* graduate: percentage of people with a graduate degree in the given tract
+* same_residence: percentage of people who have been at the same residence for the past year in a given tract
+* private_transport: percentage of people who ride in private transport to work in the given tract
+* own_car: percentage of people who drive their own car to work in the given tract
+* public_transport: percentage of people who take public transit to work in the given tract
+* bike: percentage of people who ride a bike to work in the given tract
+* walk: percentage of people who walk to work in the given tract
+* native: percentage of people who are US natives in the given tract
+* foreign_noncitizen: foreigner living in the US who is not a US citizen
+* foreign_naturalized: foreigner living in the US who is a US citizen
+* SSI: Social Security Income, percentage of people who use SSI
+
+## Unused Variables
+* GEOID: Unique GEOID of the given tract
+* state: the state which the given tract is in
+* tract: the tract that the row's data pertains to
+* county: the county the given tract is in
+* population: the population of a given tract. While this was not used directly as a predictor, it was used to normalize the predictors.
+
+
+
+```{r}
+raw_data <- readRDS("census_raw_area.RDS")
+glimpse(raw_data)
+```
+
+# Exploratory Data Analysis
+
+All variables have some extreme outliers. Skew is apparent even after scaling and limiting the range of the plot.
+```{r}
+census_n <- select(raw_data, where(is.numeric))
+census_n |>
+  map_dfc(scale) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") |>
+  ggplot(aes(x = Value, color = Variable)) +
+  geom_density(show.legend = FALSE) +
+  geom_line(aes(x = Inf, y = Inf)) +
+  lims(x = c(-2, 5)) +
+  guides(legend.title.position = "top") +
+  theme(legend.position = "bottom") +
+  labs(x = "Standard Deviations", y = "Density")
+```
+
+Median income has a somewhat positive-skewed distribution, as income is always greater than or equal to zero, though this violates no assumptions.
+Taking state medians of median income, it is closer to normal.
+```{r}
+census_n |>
+  ggplot(aes(median_income)) +
+  geom_density()
+
+group_by(raw_data, state) |>
+  summarize(median_income = median(median_income, na.rm = TRUE)) |>
+  ggplot(aes(x = 0, y = median_income, label = state)) +
+  geom_violin(fill = "skyblue") +
+  geom_point()
+```
+
+A pairs plot reveals the skew of many of the distributions, even after normalizing for population and removing unpopulated tracts. While some relationships are strong, they don't appear linear.
+
+Normalizing Data by Population
+```{r}
+census_normalized <- filter(census_n, population > 0, !is.na(median_income)) %>%
+  mutate(across(where(is.numeric) & -c(population, median_income), ~ .x / population)) %>%
+  filter(area != 0)
+```
+
+Inspecting correlation
+```{r}
+# setting up the variables that will be used for linear modeling
+# since population is of census tracts, which are not uniform in size, it would be difficult to find a meaningful interpretation of population
+census_lm <- census_normalized %>%
+  select(-population)
+
+corry <- correlate(census_lm)
+corry
+
+stretch(corry) %>%
+  filter(abs(r)>0.5)
+```
+A correlation plot. The strongest correlations with median income are 
+among the education-related variables, which is unsurprising.
+
+```{r}
+expand_grid(row = colnames(census_lm), col = row) |>
+  mutate(Correlation = c(cor(census_lm, use = "complete.obs"))) |>
+  ggplot(aes(x = fct_rev(row), y = col, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colors = c("red", "white", "blue"), breaks = c(-1, -.5, 0, .5, 1)) +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  labs(title = "Correlation Plot", x = "", y = "")
+```
+
+
+# Modeling
+
+I have to drop one variable that created a linear dependency, as well
+as some metadata.
+```{r}
+# fitting the initial linear model
+initial <- lm(median_income ~ ., data = census_lm)
+tidied <- tidy(initial)
+tidied
+```
+
+The curvature and non-constant variance of the plot clearly suggests a transformation is needed for the response variable.
+
+```{r}
+aout <- augment(initial)
+ggplot(aout, aes(.fitted, .resid))+ 
+  geom_hline(yintercept=0) +
+  geom_point(alpha = .05)
+
+# adding log of median income as a column in census_lm
+census_lm <- census_lm %>%
+  mutate(log_median_income = log(median_income))
+# fitting a new linear model with the log of median income
+logged_y <- lm(log_median_income ~ . - median_income -SSI, data=census_lm)
+tidy(logged_y)
+```
+
+Logging the response leaves a roughly linear residual plot, though with some inconsistency in variance. The QQ-Plot inevitably shows serious issues related to the zero bound for median income, but outside of this the plot is approximately linear.
+```{r}
+aout_log <- augment(logged_y)
+ggplot(aout_log, aes(.fitted, .resid))+ 
+  geom_hline(yintercept=0) +
+  geom_point(alpha = .05)
+```
+
+
+```{r}
+ggplot(aout_log, aes(sample = `log_median_income`)) +
+  geom_qq() +
+  geom_qq_line()
+```
+Taking a look at the SSE reduction from each variable
+```{r}
+Anova(logged_y)
+```
+# Transforming Area
+
+Area does not seem to be performing well, could a transformation make it more significant?
+
+Logging area
+```{r}
+census_lm
+census_lm <- mutate(census_lm, log_area = log(area))
+
+logged_y <- lm(log_median_income ~ . - median_income -SSI -area, data=census_lm)
+Anova(logged_y)
+```
+
+The log of area performs much better than area by itself. Let's remove variables that don't seem to be contributing
+
+# Attempting to Create a Person of Color Variable 
+
+Seeing if a merged predictor of black population percentage and native american merged would preform.
+
+```{r}
+logged_y_revised <- lm(log_median_income ~ black + native_american + hispanic_latino + bachelors + graduate + same_residence + bike + walk + foreign_naturalized + log_area, data = census_lm)
+Anova(logged_y_revised)
+```
+
+
+```{r}
+census_lm <- mutate(census_lm, poc = black + native_american)
+
+logged_y_POC <- lm(log_median_income ~ poc + hispanic_latino + bachelors + graduate + same_residence + bike + walk + foreign_naturalized + log_area, data = census_lm)
+Anova(logged_y_POC)
+```
+
+
+
+
+Refitting the model without parameters which did not show consequential impact within the parameters of our model.
+```{r}
+logged_y_revised <- lm(log_median_income ~ poc + bachelors + graduate + same_residence + private_transport + bike + walk + log_area, data = census_lm)
+Anova(logged_y_revised)
+```
+
+```{r}
+logged_y_revised <- lm(log_median_income ~ poc + bachelors + graduate + same_residence + private_transport + log_area + bike + walk + foreign_naturalized, data = census_lm)
+Anova(logged_y_revised)
+```
+```{r}
+logged_y_revised <- lm(log_median_income ~ black + bachelors + graduate + same_residence + private_transport + bike + walk + log_area, data = census_lm)
+Anova(logged_y_revised)
+```
+
+```{r}
+logged_y_revised <- lm(log_median_income ~ poc + bachelors + graduate + same_residence + private_transport + log_area + bike + walk + foreign_naturalized, data = census_lm)
+Anova(logged_y_revised)
+```
+
+Checking the revised parameter residuals. With the removal of numerous predictor variables, the regression model is largely unchanged.
+```{r}
+aout_logr <- augment(logged_y_revised)
+ggplot(aout_logr, aes(.fitted, .resid)) + 
+  geom_hline(yintercept=0) +
+  geom_point(alpha = .05)
+```
+
+Revised parameter qqplot, The results are not meaningfully altered by the removal of excess variables.
+```{r}
+ggplot(aout_logr, aes(sample = `log_median_income`)) +
+  geom_qq() +
+  geom_qq_line()
+```
+Checking the revised parameter model. The comparatively low impact of being white is surprising, perhaps we should see if the result will hold true for other racial parameters.
+```{r}
+Anova(logged_y_revised)
+```
+Mapping a pair plot with our preliminary parameters, obviously bachelors and graduate are heavily correlated as a graduate degree has a dependency on first obtaining a bachelors, so some categorical manipulation could be worthwhile, perhaps splitting the two variables into "bachelors and not graduate" and graduate.
+```{r}
+census_lm |>
+  select(log_median_income, black, bachelors, graduate, private_transport, same_residence, bike, walk) |>
+  ggpairs(mapping = aes(alpha = .03))
+```
+# Attempting further predictor transformations
+
+There is a slight increase in SSR for log(SSI+1) over SSI, but not enough to justify the lose of model interpretability that such a transformation would cause.
+
+## Exploring bike transformations
+```{r}
+
+# there are many tracts with 0 bike usage
+census_lm %>%
+  filter(bike==0) %>%
+  nrow()
+
+qplot(x=log(bike), y=log_median_income, data=census_lm)
+
+census_lm_trans <- census_lm %>%
+  mutate(log_bike = log(bike+1))
+
+logged_y_revised_trans <- lm(log_median_income ~ black + bachelors + graduate + same_residence + private_transport + log_bike + walk, data = census_lm_trans)
+
+Anova(logged_y_revised_trans)
+```
+There is a slight increase in SSR for log(bike+1) over bike, but not enough to justify the lose of model interpretability that such a transformation would cause.
+
+**There is a large increase in SSR** for log(foreign_naturalized+.001) over foreign_naturalized. There may be enough increase in performance to justify the transformation
+
+## Exploring graduate transformations
+```{r}
+# there are many tracts with 0 graduate students usage
+census_lm %>%
+  filter(graduate==0) %>%
+  nrow()
+qplot(x=graduate, y=log_median_income, data=census_lm)
+qplot(x=log(graduate), y=log_median_income, data=census_lm)
+
+census_lm_trans <- census_lm %>%
+  mutate(log_graduate = log(graduate+1))
+
+logged_y_revised_trans <- lm(log_median_income ~ black + bachelors + log_graduate + same_residence + private_transport + bike + walk, data = census_lm_trans)
+
+Anova(logged_y_revised_trans)
+```
+There is a slight increase in SSR for log(graduate+1) over graduate, but not enough to justify the lose of model interpretability that such a transformation would cause.
+
+
+There is a slight increase in SSR for log(bachelors+1) over bachelors, but not enough to justify the lose of model interpretability that such a transformation would cause.
+
+
+# Inspecting the Model
+
+```{r}
+tidy(logged_y_revised)
+```
+$$ Log(Income_i) = 8.6 - 0.20 * Black + 1.5*Bachelors + 2.2 *Graduate  $$
+
+
+```{r}
+aout <- augment(logged_y_revised)
+qplot(x=.fitted, y=.resid, data=aout) + 
+  geom_hline(yintercept=0)
+```
+
+# Validating the Model
+
+# Conclusions
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

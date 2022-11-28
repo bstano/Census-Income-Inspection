@@ -1,0 +1,293 @@
+---
+title: "Census Income Exploratory Data Analysis"
+author: "Ben Stano"
+date: "12/16/21"
+output: 
+  pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  fig.pos = "",
+  message = FALSE,
+  tidy = "styler",
+  warning = FALSE,
+  fig.align = "center",
+  highlight = TRUE
+)
+
+library(tidyverse)
+library(broom)
+library(GGally)
+library(corrr)
+library(car)
+```
+
+# Introduction
+
+We are interested in investigating the relationship between median income and demographic information. To do this, we used information from the American Community Survey (ACS) administered by the Census Bureau. This data is separated by tracts, census-defined communities.
+
+```{r}
+raw_data <- readRDS("census_raw_area.RDS")
+glimpse(raw_data)
+```
+
+## Variables Overview
+
+### Response
+
+* median_income: the median income of all people within a tract
+
+### Predictors
+
+The predictors in the census data were given as a flat number of individuals within the tract who meet the given criteria. We transformed the variables into proportions of  total tract population to normalize the data and make it more suitable for regression.
+
+* white: percentage of white people in the given tract 
+* bachelors: percentage of people with a bachelor's degree in the given tract
+* graduate: percentage of people with a graduate degree in the given tract
+* same_residence: percentage of people who have been at the same residence for the past year in a given tract
+* private_transport: percentage of people who ride in private transport to work in the given tract
+* own_car: percentage of people who drive their own car to work in the given tract
+* public_transport: percentage of people who take public transit to work in the given tract
+* bike: percentage of people who ride a bike to work in the given tract
+* walk: percentage of people who walk to work in the given tract
+* native: percentage of people who are US natives in the given tract
+* foreign_noncitizen: foreigner living in the US who is not a US citizen
+* foreign_naturalized: foreigner living in the US who is a US citizen
+* SSI: Social Security Income, percentage of people who use SSI
+
+### Unused Variables
+
+* GEOID: Unique GEOID of the given tract
+* state: the state which the given tract is in
+* tract: the tract that the row's data pertains to
+* county: the county the given tract is in
+* population: the population of a given tract. While this was not used directly as a predictor, it was used to normalize the predictors.
+
+
+# Exploratory Data Analysis
+
+All variables have some extreme outliers. Skew is apparent even after scaling and limiting the range of the plot.
+```{r}
+census_n <- select(raw_data, where(is.numeric))
+census_n |>
+  map_dfc(scale) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") |>
+  ggplot(aes(x = Value, color = Variable)) +
+  geom_density(show.legend = FALSE) +
+  geom_line(aes(x = Inf, y = Inf)) +
+  lims(x = c(-2, 5)) +
+  guides(legend.title.position = "top") +
+  theme(legend.position = "bottom") +
+  labs(x = "Standard Deviations", y = "Density")
+```
+
+Median income has a somewhat positive-skewed distribution, as income is always greater than or equal to zero, though this violates no assumptions.
+Taking state medians of median income, it is closer to normal.
+```{r}
+census_n |>
+  ggplot(aes(median_income)) +
+  geom_density()
+
+group_by(raw_data, state) |>
+  summarize(median_income = median(median_income, na.rm = TRUE)) |>
+  ggplot(aes(x = 0, y = median_income, label = state)) +
+  geom_violin(fill = "skyblue") +
+  geom_point()
+```
+
+A pairs plot reveals the skew of many of the distributions, even after normalizing for population and removing unpopulated tracts. While some relationships are strong, they don't appear linear.
+
+# Cleaning the Data
+
+We removed rows which had zero median income, population, and area. Then we we divided all predictors be the population, turning them into ratios. This allowed us to control for tracts with larger or smaller populations. We then removed population, as all predictors already account for it.
+```{r}
+census_lm <- filter(census_n, population > 0, !is.na(median_income)) %>%
+  mutate(across(where(is.numeric) & -c(population, median_income), ~ .x / population)) %>%
+  filter(area != 0) %>%
+  select(-population)
+```
+
+# Inspecting correlation
+```{r}
+corry <- correlate(census_lm)
+
+stretch(corry) %>%
+  filter(abs(r) > 0.5)
+```
+A correlation plot. The strongest correlations with median income are 
+among the education-related variables, which is unsurprising.
+
+```{r}
+expand_grid(row = colnames(census_lm), col = row) |>
+  mutate(Correlation = c(cor(census_lm, use = "complete.obs"))) |>
+  ggplot(aes(x = fct_rev(row), y = col, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colors = c("red", "white", "blue"), breaks = c(-1, -.5, 0, .5, 1)) +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90)) +
+  labs(title = "Correlation Plot", x = "", y = "")
+```
+
+
+# Initial Modeling
+
+We began by fitting an initial model on all predictors.
+
+```{r}
+# fitting the initial linear model
+initial <- lm(median_income ~ ., data = census_lm)
+tidied <- tidy(initial)
+tidied
+```
+
+The curvature and non-constant variance of the plot suggest a log transformation for the response variable.
+
+```{r}
+aout <- augment(initial)
+ggplot(aout, aes(.fitted, .resid)) +
+  geom_hline(yintercept = 0) +
+  geom_point(alpha = .05) +
+  ggtitle("Initial Linear Model Residuals")
+
+# adding log of median income as a column in census_lm
+census_lm <- census_lm %>%
+  mutate(log_median_income = log(median_income))
+# fitting a new linear model with the log of median income
+logged_y <- lm(log_median_income ~ . - median_income - SSI, data = census_lm)
+tidy(logged_y)
+```
+
+Logging the response leaves a roughly linear residual plot, though with some inconsistency in variance. The QQ plot shows serious issues related to the zero bound for median income, but outside of this the plot is approximately linear.
+```{r}
+aout_log <- augment(logged_y)
+ggplot(aout_log, aes(.fitted, .resid)) +
+  geom_hline(yintercept = 0) +
+  geom_point(alpha = .05) +
+  ggtitle("Logged Median Income Residuals")
+```
+
+
+# Selecting Predictors
+
+We examine the marginal SSE reduction from adding each variable.
+```{r}
+Anova(logged_y)
+```
+Some predictors have negligible Type II SSR. We hypothesize that this is because their variance is totally represented by other variables. Let's refit the model only with less related levels.
+
+```{r}
+logged_y <- lm(log_median_income ~ white + black + native_american + hispanic_latino + bachelors + graduate + same_residence + own_car + bike + walk + foreign_naturalized + area, data = census_lm)
+Anova(logged_y)
+```
+
+## Transforming Area
+
+Area did not seem to be performing well. We used a log transformation to make it a better predictor.
+
+```{r}
+census_lm <- mutate(census_lm, log_area = log(area))
+
+qplot(x = area, y = log_median_income, data = census_lm) +
+  ggtitle("Log Median Income on Area")
+qplot(x = log_area, y = log_median_income, data = census_lm) +
+  ggtitle("Log Median Income on Log Area")
+
+logged_y <- lm(log_median_income ~ white + black + native_american + hispanic_latino + bachelors + graduate + same_residence + own_car + bike + walk + foreign_naturalized + log_area, data = census_lm)
+Anova(logged_y)
+```
+
+The log of area performs much better than area by itself.
+
+## Choosing Racial/Ethnicity Variables
+
+We are using too many racial variables, which could easily lead to intercorrelation. White is already not very significant, so we decided to drop it. But we wondered if creating a person of color (PoC) variable which combined black and native american would lead to better results.
+
+```{r}
+logged_y_revised <- lm(log_median_income ~ black + native_american + hispanic_latino + bachelors + graduate + same_residence + bike + walk + foreign_naturalized + log_area, data = census_lm)
+Anova(logged_y_revised)
+```
+
+```{r}
+census_lm <- mutate(census_lm, poc = black + native_american)
+
+logged_y_POC <- lm(log_median_income ~ poc + hispanic_latino + bachelors + graduate + same_residence + bike + walk + foreign_naturalized + log_area, data = census_lm)
+Anova(logged_y_POC)
+```
+
+The composite person of color variable performs about the same as having black and native american separate, but does so with less predictors. We'll use person of color instead.
+
+
+
+## Examining Retained Variables
+
+With parameters selected, we examine them in more detail. Bachelors and graduate are heavily correlated, as we would expect, so some categorical manipulation could be worthwhile, perhaps splitting the two variables into "bachelors and not graduate" and graduate.
+```{r}
+census_lm |>
+  select(
+    log_median_income, poc, bachelors, graduate, private_transport, same_residence, bike,
+    walk, foreign_naturalized, log_area
+  ) |>
+  ggpairs(mapping = aes(alpha = .03))
+```
+
+
+# The Final Model 
+
+Refitting the model without parameters which did not show consequential impact within the parameters of our model.
+```{r}
+logged_y_final <- lm(log_median_income ~ poc + bachelors + graduate + same_residence + private_transport + bike + walk + foreign_naturalized + log_area, data = census_lm)
+Anova(logged_y_final)
+```
+```{r}
+tidy(logged_y_final)
+```
+
+The final estimated regression surface is:
+
+$$ \log{Income_i} = 8.5 - 0.15 * POC + 1.6*Bachelors + 2.2 *Graduate + 0.91 * SameResidence + 1.0 * PrivateTransport - 5.1 * Bike - 1.9 * Walk + 0.56 * ForeignNaturalized + 0.02 * \log{Area}  $$
+
+
+## Inspecting the Final Model
+
+We next examine residual plots of the final model to validate model assumptions. With the removal of numerous predictor variables, the regression model is largely unchanged.
+```{r}
+aout_logr <- augment(logged_y_final)
+ggplot(aout_logr, aes(.fitted, .resid)) +
+  geom_hline(yintercept = 0) +
+  geom_point(alpha = .05)
+```
+
+The residual QQ plot is not meaningfully altered by the use of our final variables.
+```{r}
+ggplot(aout_logr, aes(sample = `log_median_income`)) +
+  geom_qq() +
+  geom_qq_line()
+```
+# Conclusions
+
+Interpretations of Variables, controlling for all other variables:
+
+$$ \log{Income_i} = 8.5 - 0.15 * POC + 1.6*Bachelors + 2.2 *Graduate + 0.91 * SameResidence + 1.0 * PrivateTransport - 5.1 * Bike - 1.9 * Walk + 0.56 * ForeignNaturalized + 0.02 * \log{Area}  $$
+
+* **POC:** Tracts with 10% more black or native american people tend to have 1.6% less median income
+* **Bachelor:** Tracts with 10% more people with a bachelors degree tend to have 17% more median income
+* **Graduate:** Tracts with 10% more people with a graduate degree tend to have 25% more median income
+* **Same Residence:** Tracts with 10% more people who have lived at the same residence for a year tend to have 9.6% more median income
+* **Private Transport:** Tracts with 10% more people who take private transport to work tend to have 11% more median income
+* **Bike:** Tracts with 1% more people who bike to work tend to have 5.0% less median income
+* **Walk:** Tracts with 1% more people who walk to work tend to have 1.9% less median income
+* **Foreign Naturalized:** Tracts with 10% more people who are foreign naturalized citizens tend to have 5.8% more median income
+* **Area:**Tracts with 100% higher land to people ratio tend to have 1.2% more median income
+
+Some predictors had an expected effect on median income. The effect shown by **Bachelor** and **Graduate** are both very expected. The effects shown in **Same Residence** and **Private Transport** are both expected as well. People who don't need to move around will have more stable income and people who have their own transport or know others who will share will have a larger income. 
+
+**POC** was somewhat surprising, as we thought that it would have more of an impact, given the social climate of the US. But it is possible that other predictors are containing information on how black and native Americans are being marginalized. 
+
+**Foreign Naturalized** was also surprising, we thought that being foreign naturalized would be a disadvantage, but our model suggests otherwise. This effect could be acting as a correction for the effect of **POC**, as immigrants wou*ld be less likely to be marginalized based on race throughout their lives.
+
+**Area** was very surprising. Median income tends to increase as the amount of land goes up, aka as population density goes down. Usually one would expect wages in cities to be higher than in rural areas. And while richer people tend to move out of the cities and live in suburbs, our use of median income should have better protected our results from skew. Perhaps there is a larger exodus of richer Americans from cities than has previously been suggested?
+
+**Bike** and **Walk** are very interesting effects. We had similar effects in previous models, and assumed that both of these predictors were behaving in such a way because they were acting as a indicator for city life. In fact, we brought in **Area** as a predictor to try and control for this. But even after bringing in **Area**, they still show that more people biking or walking to work tend to be associated with less median income.
+
